@@ -27,6 +27,82 @@ function getGeminiClient() {
   return aiClient;
 }
 
+// Helper function to call Gemini with exponential backoff and a fallback model in case of 503 UNAVAILABLE/overload
+async function generateWithRetryAndFallback(
+  ai: GoogleGenAI,
+  userPrompt: string,
+  systemInstruction: string,
+  temperature: number = 0.7
+): Promise<string> {
+  const models = ["gemini-3.5-flash", "gemini-3.1-flash-lite"];
+  let lastError: any = null;
+
+  for (const model of models) {
+    let delay = 1500; // Start with 1.5s delay
+    const maxRetries = model === "gemini-3.5-flash" ? 3 : 2;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        console.log(`Mencoba membuat materi menggunakan model ${model} (Upaya ${attempt}/${maxRetries})...`);
+        const response = await ai.models.generateContent({
+          model,
+          contents: userPrompt,
+          config: {
+            systemInstruction,
+            temperature,
+          },
+        });
+
+        const text = response.text;
+        if (text && text.trim().length > 0) {
+          console.log(`Berhasil membuat materi menggunakan model ${model}!`);
+          return text;
+        }
+        throw new Error("Respons dari model kosong.");
+      } catch (error: any) {
+        lastError = error;
+        console.warn(`Upaya ${attempt} dengan model ${model} gagal:`, error?.message || error);
+
+        // Check if error is due to high demand / overloaded / rate limit / 503 / 429
+        const errorMsg = String(error?.message || "").toLowerCase();
+        const errorStatus = String(error?.status || "").toUpperCase();
+        const errorCode = error?.code;
+
+        const isRetryable =
+          errorStatus === "UNAVAILABLE" ||
+          errorStatus === "RESOURCE_EXHAUSTED" ||
+          errorCode === 503 ||
+          errorCode === 429 ||
+          errorMsg.includes("503") ||
+          errorMsg.includes("429") ||
+          errorMsg.includes("demand") ||
+          errorMsg.includes("temporary") ||
+          errorMsg.includes("unavailable") ||
+          errorMsg.includes("overloaded") ||
+          errorMsg.includes("exhausted") ||
+          errorMsg.includes("limit");
+
+        if (isRetryable && attempt < maxRetries) {
+          console.log(`Layanan sedang sibuk (lonjakan permintaan). Mencoba kembali dalam ${delay}ms...`);
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          delay *= 2.2; // Exponential backoff
+        } else {
+          // If not retryable or reached max retries for this model, break to try the fallback model
+          break;
+        }
+      }
+    }
+    console.log(`Model ${model} gagal memproses permintaan setelah batas percobaan. Mencoba model berikutnya jika ada...`);
+  }
+
+  // If all models and retries fail, construct a clear and descriptive Indonesian error message
+  const details = lastError?.message || JSON.stringify(lastError);
+  throw new Error(
+    `Asisten AI kami sedang menerima lonjakan antrean yang sangat tinggi dari Google (Layanan Sedang Sibuk / Error 503). ` +
+    `Silakan coba klik tombol lagi dalam beberapa saat, atau coba persingkat topik pencarian Anda.\n\nDetail Teknis: ${details}`
+  );
+}
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
@@ -69,20 +145,8 @@ async function startServer() {
       // Initialize client lazily and safely
       const ai = getGeminiClient();
 
-      // Call Gemini 3.5 Flash (the recommended default for text tasks)
-      const response = await ai.models.generateContent({
-        model: "gemini-3.5-flash",
-        contents: userPrompt,
-        config: {
-          systemInstruction,
-          temperature: 0.7,
-        }
-      });
-
-      const markdownText = response.text;
-      if (!markdownText) {
-        throw new Error("Gemini tidak mengembalikan respons teks.");
-      }
+      // Call Gemini with exponential backoff and fallback model support
+      const markdownText = await generateWithRetryAndFallback(ai, userPrompt, systemInstruction, 0.7);
 
       return res.json({ result: markdownText });
     } catch (error: any) {
